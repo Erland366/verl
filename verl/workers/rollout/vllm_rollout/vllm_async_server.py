@@ -77,6 +77,27 @@ logger = logging.getLogger(__file__)
 logger.setLevel(logging.INFO)
 
 
+def _normalize_visible_device_env(visible_devices: str) -> None:
+    """Set a single accelerator visibility env var for child-process safety.
+
+    On ROCm, Ray worker imports fail if both HIP_VISIBLE_DEVICES and
+    CUDA_VISIBLE_DEVICES are present. vLLM uses CUDA_VISIBLE_DEVICES on ROCm,
+    so keep that and remove conflicting inherited variables before spawning
+    engine subprocesses.
+    """
+    device_env_var = get_visible_devices_keyword()
+    os.environ[device_env_var] = visible_devices
+
+    conflicting_vars = {"ROCR_VISIBLE_DEVICES"}
+    if device_env_var == "CUDA_VISIBLE_DEVICES":
+        conflicting_vars.add("HIP_VISIBLE_DEVICES")
+    elif device_env_var == "HIP_VISIBLE_DEVICES":
+        conflicting_vars.add("CUDA_VISIBLE_DEVICES")
+
+    for env_var in conflicting_vars:
+        os.environ.pop(env_var, None)
+
+
 class vLLMHttpServer:
     """vLLM http server in single node, this is equivalent to launch server with command line:
     ```
@@ -107,7 +128,7 @@ class vLLMHttpServer:
             nnodes (int): number of nodes.
             cuda_visible_devices (str): cuda visible devices.
         """
-        os.environ[get_visible_devices_keyword()] = cuda_visible_devices
+        _normalize_visible_device_env(cuda_visible_devices)
 
         self.config = self._init_config(config)
         self.model_config = self._init_model_config(model_config)
@@ -161,9 +182,9 @@ class vLLMHttpServer:
     def get_master_address(self):
         """Get master address and port for data parallel.
         Returns:
-            tuple: (master_address, master_port, dp_rpc_port)
+            tuple: (master_address, master_port, dp_rpc_port, dp_master_port)
         """
-        return self._master_address, self._master_port, self._dp_rpc_port
+        return self._master_address, self._master_port, self._dp_rpc_port, self._dp_master_port
 
     def get_server_address(self):
         """Get http server address and port."""
@@ -190,14 +211,24 @@ class vLLMHttpServer:
             kwargs=kwargs,
         )
 
-    async def launch_server(self, master_address: str = None, master_port: int = None, dp_rpc_port: int = None):
+    async def launch_server(
+        self,
+        master_address: str = None,
+        master_port: int = None,
+        dp_rpc_port: int = None,
+        dp_master_port: int = None,
+    ):
         if self.node_rank != 0:
-            assert master_address and master_port and dp_rpc_port, (
-                "non-master node should provide master_address, master_port and dp_rpc_port"
+            assert master_address is not None, "non-master node should provide master_address"
+            assert master_port is not None, "non-master node should provide master_port"
+            assert dp_rpc_port is not None, "non-master node should provide dp_rpc_port"
+            assert dp_master_port is not None, (
+                "non-master node should provide dp_master_port so vLLM external-DP handshake metadata is complete"
             )
             self._master_address = master_address
             self._master_port = master_port
             self._dp_rpc_port = dp_rpc_port
+            self._dp_master_port = dp_master_port
 
         # 1. setup vllm serve cli args
         engine_kwargs = self.config.get("engine_kwargs", {}).get(self._get_engine_kwargs_key(), {}) or {}
@@ -208,6 +239,12 @@ class vLLMHttpServer:
             engine_kwargs["cuda_graph_sizes"] = self.config.cudagraph_capture_sizes
 
         self._preprocess_engine_kwargs(engine_kwargs)
+        use_external_dp_lb = bool(engine_kwargs.get("data_parallel_external_lb"))
+        use_hybrid_dp_lb = bool(engine_kwargs.get("data_parallel_hybrid_lb"))
+        if use_external_dp_lb and _VLLM_VERSION < version.parse("0.12.0"):
+            # Older vLLM infers external-DP LB from --data-parallel-rank and
+            # does not expose a separate --data-parallel-external-lb CLI flag.
+            engine_kwargs.pop("data_parallel_external_lb", None)
 
         # Override default generation config from hugging face model config,
         # user can still override them by passing kwargs in each request.
@@ -302,10 +339,13 @@ class vLLMHttpServer:
             dp_args = {
                 "data_parallel_size": self.config.data_parallel_size,
                 "data_parallel_size_local": data_parallel_size_local,
-                "data_parallel_start_rank": self.node_rank * data_parallel_size_local,
                 "data_parallel_address": self._master_address,
                 "data_parallel_rpc_port": self._dp_rpc_port,
             }
+            if use_external_dp_lb:
+                dp_args["data_parallel_rank"] = self.node_rank
+            else:
+                dp_args["data_parallel_start_rank"] = self.node_rank * data_parallel_size_local
             args.update(dp_args)
 
         args.update({"enable_expert_parallel": self.config.expert_parallel_size > 1})
@@ -366,7 +406,8 @@ class vLLMHttpServer:
             cmds[server_args.subparser].validate(server_args)
 
         # 3. launch server
-        if self.node_rank == 0:
+        use_non_headless_dp_lb = use_external_dp_lb or use_hybrid_dp_lb
+        if self.node_rank == 0 or use_non_headless_dp_lb:
             await self.run_server(server_args)
         else:
             await self.run_headless(server_args)
@@ -886,6 +927,9 @@ class vLLMReplica(RolloutReplica):
 
         self._validate_launch_requirements()
 
+        engine_kwargs = self.config.get("engine_kwargs", {}).get("vllm", {}) or {}
+        use_external_dp_lb = self.config.data_parallel_size > 1 and bool(engine_kwargs.get("data_parallel_external_lb"))
+
         # get (node_id, CUDA_VISIBLE_DEVICES) of all workers
         worker_infos = await asyncio.gather(
             *[
@@ -901,21 +945,56 @@ class vLLMReplica(RolloutReplica):
         worker_cuda_visible_devices = [worker_info[1] for worker_info in worker_infos]
         worker_node_ids = [worker_info[0] for worker_info in worker_infos]
 
-        # create server actor in each node with node affinity and cuda visible devices
+        # create server actor(s) with node affinity and visible-device groups
         nnodes, gpus_per_replica_node = self.nnodes, self.gpus_per_replica_node
-        for node_rank in range(nnodes):
-            workers = self.workers[node_rank * gpus_per_replica_node : (node_rank + 1) * gpus_per_replica_node]
-            node_cuda_visible_devices = ",".join(
-                worker_cuda_visible_devices[node_rank * gpus_per_replica_node : (node_rank + 1) * gpus_per_replica_node]
+        server_specs: list[tuple[list[ActorHandle], str, str, int, int, int]] = []
+        prefix = self._get_server_name_prefix()
+
+        if use_external_dp_lb:
+            assert nnodes == 1, "Single-node external DP smoke path only supports nnodes=1"
+            tp_size = self.config.tensor_model_parallel_size
+            assert tp_size > 0, "tensor_model_parallel_size must be positive"
+            assert gpus_per_replica_node % tp_size == 0, (
+                "gpus_per_replica_node should be divisible by tensor_model_parallel_size "
+                "when using external data parallel load balancing"
             )
-            node_id = worker_node_ids[node_rank * gpus_per_replica_node]
-            prefix = self._get_server_name_prefix()
-            if self.is_reward_model:
-                name = f"{prefix}server_reward_{self.replica_rank}_{node_rank}"
-            elif self.is_teacher_model:
-                name = f"{prefix}server_teacher_{self.replica_rank}_{node_rank}"
-            else:
-                name = f"{prefix}server_{self.replica_rank}_{node_rank}"
+            data_parallel_size_local = gpus_per_replica_node // tp_size
+            assert data_parallel_size_local == self.config.data_parallel_size, (
+                "Single-node external DP smoke path expects one local engine per DP rank: "
+                f"local={data_parallel_size_local}, configured={self.config.data_parallel_size}"
+            )
+
+            for dp_rank in range(data_parallel_size_local):
+                start = dp_rank * tp_size
+                stop = (dp_rank + 1) * tp_size
+                workers = self.workers[start:stop]
+                node_cuda_visible_devices = ",".join(worker_cuda_visible_devices[start:stop])
+                node_id = worker_node_ids[start]
+                if self.is_reward_model:
+                    name = f"{prefix}server_reward_{self.replica_rank}_{dp_rank}"
+                elif self.is_teacher_model:
+                    name = f"{prefix}server_teacher_{self.replica_rank}_{dp_rank}"
+                else:
+                    name = f"{prefix}server_{self.replica_rank}_{dp_rank}"
+                server_specs.append((workers, node_cuda_visible_devices, node_id, dp_rank, tp_size, 1, name))
+        else:
+            for node_rank in range(nnodes):
+                start = node_rank * gpus_per_replica_node
+                stop = (node_rank + 1) * gpus_per_replica_node
+                workers = self.workers[start:stop]
+                node_cuda_visible_devices = ",".join(worker_cuda_visible_devices[start:stop])
+                node_id = worker_node_ids[start]
+                if self.is_reward_model:
+                    name = f"{prefix}server_reward_{self.replica_rank}_{node_rank}"
+                elif self.is_teacher_model:
+                    name = f"{prefix}server_teacher_{self.replica_rank}_{node_rank}"
+                else:
+                    name = f"{prefix}server_{self.replica_rank}_{node_rank}"
+                server_specs.append(
+                    (workers, node_cuda_visible_devices, node_id, node_rank, gpus_per_replica_node, nnodes, name)
+                )
+
+        for workers, visible_devices, node_id, node_rank, server_gpus_per_node, server_nnodes, name in server_specs:
             server = self.server_class.options(
                 scheduling_strategy=ray.util.scheduling_strategies.NodeAffinitySchedulingStrategy(
                     node_id=node_id,
@@ -941,18 +1020,21 @@ class vLLMReplica(RolloutReplica):
                 workers=workers,
                 replica_rank=self.replica_rank,
                 node_rank=node_rank,
-                gpus_per_node=gpus_per_replica_node,
-                nnodes=nnodes,
-                cuda_visible_devices=node_cuda_visible_devices,
+                gpus_per_node=server_gpus_per_node,
+                nnodes=server_nnodes,
+                cuda_visible_devices=visible_devices,
             )
             self.servers.append(server)
 
         # launch http server in each node
-        master_address, master_port, dp_rpc_port = await self.servers[0].get_master_address.remote()
+        master_address, master_port, dp_rpc_port, dp_master_port = await self.servers[0].get_master_address.remote()
         await asyncio.gather(
             *[
                 server.launch_server.remote(
-                    master_address=master_address, master_port=master_port, dp_rpc_port=dp_rpc_port
+                    master_address=master_address,
+                    master_port=master_port,
+                    dp_rpc_port=dp_rpc_port,
+                    dp_master_port=dp_master_port,
                 )
                 for server in self.servers
             ]

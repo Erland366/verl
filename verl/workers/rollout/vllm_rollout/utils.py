@@ -77,8 +77,25 @@ def get_device_uuid(device_id: int) -> str:
             return "NPU-" + npu_visible_devices[device_id]
         else:
             return f"NPU-{device_id}"
-    else:
+
+    visible_device_ids = os.environ.get(current_platform.device_control_env_var)
+    fallback_device_id = str(device_id)
+    if visible_device_ids:
+        accelerator_ids = [accelerator_id.strip() for accelerator_id in visible_device_ids.split(",")]
+        assert device_id < len(accelerator_ids), (
+            f"device_id {device_id} must be less than visible accelerator ids {accelerator_ids}"
+        )
+        fallback_device_id = accelerator_ids[device_id]
+
+    try:
         return current_platform.get_device_uuid(device_id)
+    except NotImplementedError:
+        logger.warning(
+            "Platform %s does not implement get_device_uuid(); falling back to visible accelerator id %s",
+            current_platform.device_name,
+            fallback_device_id,
+        )
+        return f"{current_platform.device_name}-{fallback_device_id}"
 
 
 def get_vllm_max_lora_rank(lora_rank: int):

@@ -236,6 +236,85 @@ Install with AMD GPUs - ROCM kernel support
 When you run on AMD GPUs (MI300) with ROCM platform, you cannot use the previous quickstart to run verl. You should follow the following steps to build a docker and run it.
 If you encounter any issues in using AMD GPUs running verl, feel free to contact me - `Yusheng Su <https://yushengsu-thu.github.io/>`_.
 
+Native conda install for core verl on AMD
+:::::::::::::::::::::::::::::::::::::::::
+
+If you only need the core ``verl`` package, editable source install, and trainer entrypoints such as ``python -m verl.trainer.main_ppo --help``, you can use the native ROCm install script below instead of the Docker-based vLLM/SGLang path.
+
+This path was validated on an AMD Instinct MI210 (``gfx90a``) host with ROCm 6.3.x using the conda env ``verlrl``.
+
+.. code-block:: bash
+
+    # from the repo root
+    bash scripts/install_verl_amd_conda.sh
+
+The script will:
+
+- create ``verlrl`` if it does not already exist
+- install ROCm PyTorch and the validated Python dependency set, including ``trl`` for PPO value-head critics and the extra native smoke-path dependencies used by the local ROCm ``vLLM`` checkout
+- install ``verl`` in editable mode
+- add conda activation hooks that disable user-site package leakage, normalize AMD device visibility variables for this environment, keep ``RAY_EXPERIMENTAL_NOSET_HIP_VISIBLE_DEVICES=1`` for zero-GPU Ray actors on the native ROCm path, enable ``HSA_FORCE_FINE_GRAIN_PCIE=1`` for MI210 PCIe P2P, and default ``RCCL_MSCCL_ENABLE=0`` plus ``RCCL_MSCCLPP_ENABLE=0`` for the validated smoke path
+- patch Triton in-place so ``triton.compiler.compiler.triton_key``, the missing ``CompiledKernel`` launch-hook attributes, and the missing compiled-kernel ``cluster_dims`` compatibility fields are available for the local PyTorch 2.7 ROCm stack
+- patch the local ROCm ``vLLM`` source checkout under ``/tmp/vllm-v0.10.0`` when it is present so empty HIP visibility no longer breaks native smoke startup
+- run a final smoke test on ROCm PyTorch, ``ray``, and ``verl``
+
+On this native ROCm path, ``verl`` also falls back to the visible accelerator id when a ROCm ``vLLM`` build does not implement hardware UUID lookup for rollout IPC socket naming yet.
+
+This native script intentionally covers the validated core ``verl`` path only. If you also need ROCm ``vLLM`` or ``SGLang``, use the Docker/source-build workflow below.
+
+After installation, you can run the validated 4-GPU native smoke launcher for ``Qwen/Qwen2.5-3B-Instruct`` with:
+
+.. code-block:: bash
+
+    conda activate verlrl
+    bash scripts/run_qwen25_3b_4gpu_smoke.sh
+
+This smoke launcher uses the ``vllm`` async rollout backend and defaults to
+``ADV_ESTIMATOR=grpo`` plus ``ATTN_IMPLEMENTATION=eager`` so the native ROCm
+smoke path avoids the separate PPO critic model and does not depend on
+``flash_attention_2``. You can still request the PPO/GAE critic path with
+``ADV_ESTIMATOR=gae`` when debugging critic initialization specifically.
+
+On MI210 native ROCm hosts, the same smoke launcher also defaults ``vLLM`` to
+``compilation_config.mode=0``, ``compilation_config.backend=eager``, and
+``compilation_config.cudagraph_mode=NONE``. It also defaults
+``actor_rollout_ref.rollout.free_cache_engine=False`` and
+``+actor_rollout_ref.rollout.enable_sleep_mode=False`` because the validated
+native ``vLLM`` 0.10 ROCm build rejects sleep mode on MI210. It also defaults
+the FSDP ``actor``, ``ref``, and ``critic`` workers, including their nested FSDP
+engine configs, to ``use_torch_compile=False`` on this AMD smoke path. It keeps
+``actor_rollout_ref.model.use_remove_padding=True`` and
+``critic.model.use_remove_padding=True`` by default; when this native ROCm
+``verlrl`` environment does not provide the CUDA ``flash_attn.bert_padding`` module,
+``verl`` uses the compatible Hugging Face padding helpers instead. It also keeps
+``RAY_EXPERIMENTAL_NOSET_HIP_VISIBLE_DEVICES=1`` so zero-GPU Ray actors do not
+drop AMD device visibility before import-time ``vLLM`` platform checks, and it
+exports ``HSA_FORCE_FINE_GRAIN_PCIE=1``, ``RCCL_MSCCL_ENABLE=0``, and
+``RCCL_MSCCLPP_ENABLE=0`` for a more conservative MI210 PCIe RCCL setup. That
+keeps rollout startup on the eager path and avoids the current TorchInductor,
+Triton, zero-visible-device, and unstable RCCL startup mismatches on native
+ROCm installs.
+
+For the validated 4-GPU native MI210 smoke path, we currently use
+``actor_rollout_ref.rollout.tensor_model_parallel_size=1``,
+``actor_rollout_ref.rollout.data_parallel_size=4``, and
+``+actor_rollout_ref.rollout.engine_kwargs.vllm.data_parallel_external_lb=True``.
+On this path, ``verl`` normalizes each ``vLLM`` server actor to a single
+visible-device environment variable before engine subprocess spawn and launches
+all external-DP ranks in non-headless mode so ROCm Ray worker imports and
+external-DP engine startup stay compatible.
+
+For the validated MI210 ``gfx90a`` setup, the launcher also prepends two paths to ``PYTHONPATH`` when ``ROLLOUT_NAME=vllm``:
+
+- ``/tmp/vllm-v0.10.0`` for the locally built ROCm ``vLLM`` source checkout
+- ``/opt/rocm-6.3.3/share/amd_smi`` for the ROCm ``amdsmi`` Python bindings used by ``vLLM`` platform detection
+
+On this native ROCm path, ``verl`` also accepts ``vLLM`` version discovery from ``vllm.__version__`` when the package is imported from a source checkout instead of an installed wheel.
+
+You can override these with ``VLLM_SOURCE_ROOT`` and ``AMDSMI_PYTHONPATH`` if your local ROCm ``vLLM`` build lives elsewhere.
+
+For a longer native ROCm run, the launcher also accepts environment overrides such as ``TRAIN_MAX_SAMPLES``, ``VAL_MAX_SAMPLES``, ``TRAIN_BATCH_SIZE``, ``TOTAL_EPOCHS``, and ``EXPERIMENT_NAME``.
+
 Find the docker for AMD ROCm: `docker/Dockerfile.rocm <https://github.com/volcengine/verl/blob/main/docker/Dockerfile.rocm>`_
 ::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::
 

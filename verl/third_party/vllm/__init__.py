@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from importlib import import_module
 from importlib.metadata import PackageNotFoundError, version
 
 from packaging import version as vs
@@ -24,7 +25,11 @@ def get_version(pkg):
     try:
         return version(pkg)
     except PackageNotFoundError:
-        return None
+        try:
+            module = import_module(pkg)
+        except ModuleNotFoundError:
+            return None
+        return getattr(module, "__version__", None)
 
 
 package_name = "vllm"

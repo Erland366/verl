@@ -87,6 +87,23 @@ class ServerAdapter(BaseRollout):
             self.replica_rank = replica_rank
         self.rollout_rank = rank % rollout_world_size
         self.node_rank = self.rollout_rank // local_world_size
+        engine_kwargs = self.config.engine_kwargs or {}
+        vllm_engine_kwargs = engine_kwargs.get("vllm", {}) or {}
+        self._use_external_dp_lb = self.config.data_parallel_size > 1 and bool(
+            vllm_engine_kwargs.get("data_parallel_external_lb")
+        )
+        if self._use_external_dp_lb:
+            assert self.config.pipeline_model_parallel_size == 1, (
+                "external data-parallel load balancing with the native async vLLM "
+                "server adapter expects pipeline_model_parallel_size=1"
+            )
+            tp_size = self.config.tensor_model_parallel_size
+            assert tp_size > 0, "tensor_model_parallel_size must be positive"
+            self.server_rank = self.rollout_rank // tp_size
+            self._drives_server_collective = self.rollout_rank % tp_size == 0
+        else:
+            self.server_rank = self.node_rank
+            self._drives_server_collective = self.rollout_rank == 0
 
         if config.layered_summon or (config.expert_parallel_size > 1 and not _check_vllm_version_for_sleep_level()):
             logger.warning("Setting the sleep level to 1 may cause a memory overflow.")
@@ -126,12 +143,12 @@ class ServerAdapter(BaseRollout):
         Returns:
             The result of the method execution, or None if non_block=True.
         """
-        if self.rollout_rank != 0:
+        if not self._drives_server_collective:
             return None
 
         # Lazy init http server adapter because http server is launched after hybrid engine.
         if self.server_handle is None:
-            self.server_handle = ray.get_actor(f"vllm_server_{self.replica_rank}_{self.node_rank}")
+            self.server_handle = ray.get_actor(f"vllm_server_{self.replica_rank}_{self.server_rank}")
 
         future = self.server_handle.collective_rpc.remote(method, timeout=timeout, args=args, kwargs=kwargs)
         return future if non_block else await future
